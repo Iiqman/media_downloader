@@ -1,14 +1,13 @@
 """
 Platform Widget - Widget untuk handle download per platform
-UPDATED (Crash-safe):
-- Remove QtNetwork usage (avoid QNetworkSession conversion warning & potential native crash)
-- Threaded thumbnail loader (urllib)
-- Threaded multi-download (no UI freeze)
-- Proper state reset between fetches
-- Safer downloader method calling with fallbacks
+UPDATED (Crash-safe + Responsive + Race-safe):
+- Fix RuntimeError: wrapped C/C++ object ... has been deleted (ThumbThread)
+- Avoid overriding QThread.finished (no custom signal named "finished")
+- Thumbnail loader uses urllib thread, safe cleanup + late-signal ignore
+- Multi-download threaded to avoid UI freeze
+- Responsive thumbnail scaling and layout reflow
 """
 
-import os
 import ssl
 import urllib.request
 
@@ -16,7 +15,8 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
     QPushButton, QLabel, QComboBox, QProgressBar,
     QRadioButton, QButtonGroup, QScrollArea, QGroupBox,
-    QCheckBox, QGridLayout, QMessageBox, QSpinBox
+    QCheckBox, QGridLayout, QMessageBox, QSpinBox,
+    QBoxLayout, QSizePolicy
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QThread, pyqtSlot
 from PyQt5.QtGui import QPixmap
@@ -25,9 +25,6 @@ from backend import YouTubeDownloader, InstagramDownloader, TikTokDownloader, Fa
 from utils import HistoryManager
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def _shorten(text: str, n: int = 80) -> str:
     if not text:
         return ""
@@ -37,35 +34,31 @@ def _shorten(text: str, n: int = 80) -> str:
 # -----------------------------
 # Worker Threads
 # -----------------------------
-class DownloadThread(QThread):
-    """Thread generic untuk panggil method downloader agar tidak blocking UI"""
-    finished = pyqtSignal(dict)
-    error = pyqtSignal(str)
+class CallThread(QThread):
+    """Generic thread for calling a method on target (downloader/widget)."""
+    result = pyqtSignal(dict)
+    failed = pyqtSignal(str)
 
-    def __init__(self, downloader, method_name: str, *args, **kwargs):
+    def __init__(self, target, method_name: str, *args, **kwargs):
         super().__init__()
-        self.downloader = downloader
+        self.target = target
         self.method_name = method_name
         self.args = args
         self.kwargs = kwargs
 
     def run(self):
         try:
-            method = getattr(self.downloader, self.method_name)
-            result = method(*self.args, **self.kwargs)
-            # pastikan dict (biar konsisten)
-            if isinstance(result, dict):
-                self.finished.emit(result)
-            else:
-                self.finished.emit({"result": result})
+            method = getattr(self.target, self.method_name)
+            res = method(*self.args, **self.kwargs)
+            self.result.emit(res if isinstance(res, dict) else {"result": res})
         except Exception as e:
-            self.error.emit(str(e))
+            self.failed.emit(str(e))
 
 
-class ThumbnailThread(QThread):
-    """Thread untuk download thumbnail via urllib (hindari QtNetwork crash/warning)."""
-    finished = pyqtSignal(bytes)
-    error = pyqtSignal(str)
+class ThumbThread(QThread):
+    """Download thumbnail bytes via urllib (no QtNetwork)."""
+    data_ready = pyqtSignal(bytes)
+    failed = pyqtSignal(str)
 
     def __init__(self, url: str):
         super().__init__()
@@ -78,10 +71,9 @@ class ThumbnailThread(QThread):
     def run(self):
         try:
             if not self.url:
-                self.error.emit("Thumbnail URL kosong")
+                self.failed.emit("Thumbnail URL kosong")
                 return
 
-            # User-Agent penting biar tidak 403 di beberapa CDN
             req = urllib.request.Request(
                 self.url,
                 headers={
@@ -90,8 +82,6 @@ class ThumbnailThread(QThread):
                                   "Chrome/120.0 Safari/537.36"
                 }
             )
-
-            # SSL context aman (kadang perlu kalau SSL error)
             ctx = ssl.create_default_context()
 
             with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
@@ -100,17 +90,17 @@ class ThumbnailThread(QThread):
             if self._abort:
                 return
 
-            self.finished.emit(data)
+            self.data_ready.emit(data)
         except Exception as e:
             if not self._abort:
-                self.error.emit(str(e))
+                self.failed.emit(str(e))
 
 
 class MultiDownloadThread(QThread):
-    """Thread untuk download banyak item + progress."""
-    progress = pyqtSignal(int, int, str)   # done, total, status_text
-    finished = pyqtSignal(dict)
-    error = pyqtSignal(str)
+    """Thread download multiple urls with progress."""
+    progress = pyqtSignal(int, int, str)   # done, total, text
+    done = pyqtSignal(dict)
+    failed = pyqtSignal(str)
 
     def __init__(self, downloader, urls, output_path, quality=None, download_type=None):
         super().__init__()
@@ -125,28 +115,18 @@ class MultiDownloadThread(QThread):
         self._abort = True
 
     def _call_download_with_fallback(self, url):
-        """
-        Karena signature downloader bisa beda-beda, kita coba beberapa variasi.
-        Urutan: paling lengkap -> paling minimal.
-        """
         attempts = [
-            # (positional args)
             (url, self.output_path, self.quality, self.download_type, None, None, None),
             (url, self.output_path, self.quality, self.download_type),
             (url, self.output_path, self.quality),
             (url, self.output_path),
         ]
-
         last_err = None
         for args in attempts:
             try:
-                # buang None di belakang kalau method tidak mau argumen kebanyakan
                 return self.downloader.download(*args)
             except TypeError as e:
                 last_err = e
-                continue
-
-        # kalau semua gagal, lempar error terakhir
         raise last_err if last_err else TypeError("Signature downloader.download tidak cocok.")
 
     def run(self):
@@ -159,22 +139,18 @@ class MultiDownloadThread(QThread):
                     break
 
                 self.progress.emit(i - 1, total, f"Downloading {i}/{total}...")
-
                 try:
                     res = self._call_download_with_fallback(url)
-                    if isinstance(res, dict):
-                        results.append(res)
-                    else:
-                        results.append({"result": res, "success": True})
+                    results.append(res if isinstance(res, dict) else {"result": res, "success": True})
                 except Exception as e:
-                    # jangan stop total; lanjut item berikutnya
                     results.append({"success": False, "error": str(e), "url": url})
 
                 self.progress.emit(i, total, f"Downloaded {i}/{total}")
 
-            self.finished.emit({"results": results, "count": len([r for r in results if r.get("success")])})
+            ok_count = len([r for r in results if r.get("success")])
+            self.done.emit({"results": results, "count": ok_count})
         except Exception as e:
-            self.error.emit(str(e))
+            self.failed.emit(str(e))
 
 
 # -----------------------------
@@ -182,6 +158,10 @@ class MultiDownloadThread(QThread):
 # -----------------------------
 class PlatformWidget(QWidget):
     download_complete = pyqtSignal(dict)
+
+    NARROW_WIDTH = 560
+    THUMB_MIN_W = 180
+    THUMB_MAX_W = 520
 
     def __init__(self, platform, config):
         super().__init__()
@@ -191,9 +171,9 @@ class PlatformWidget(QWidget):
         self.current_info = None
 
         self._thumb_thread = None
-        self._worker_threads = []  # tahan reference biar tidak ke-GC
+        self._thumb_pixmap_original = None
+        self._threads = []  # keep refs
 
-        # Initialize downloader
         if platform == "YouTube":
             self.downloader = YouTubeDownloader()
         elif platform == "Instagram":
@@ -206,20 +186,46 @@ class PlatformWidget(QWidget):
             raise ValueError(f"Platform tidak dikenal: {platform}")
 
         self.init_ui()
+        self._apply_responsive_rules()
+
+    # -----------------------------
+    # Thread helper (FIXED)
+    # -----------------------------
+    def _keep_thread(self, t: QThread):
+        """
+        Keep reference; cleanup on QThread.finished (built-in).
+        PENTING: kalau thread yg selesai adalah thumb thread yg sedang aktif,
+        set self._thumb_thread = None sebelum deleteLater.
+        """
+        self._threads.append(t)
+
+        def _cleanup():
+            # null-kan thumb ref kalau itu thread yg aktif
+            if getattr(self, "_thumb_thread", None) is t:
+                self._thumb_thread = None
+
+            try:
+                self._threads.remove(t)
+            except ValueError:
+                pass
+
+            # deleteLater bisa membuat wrapper "dangling" -> kita pastikan ref penting sudah None
+            t.deleteLater()
+
+        t.finished.connect(_cleanup)
 
     # -----------------------------
     # UI
     # -----------------------------
     def init_ui(self):
-        """Inisialisasi UI - RESPONSIVE"""
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        # Input section
+        # Input
         input_group = QGroupBox("Input")
         input_layout = QVBoxLayout(input_group)
 
-        # Platform-specific input
         if self.platform in ["Instagram", "TikTok"]:
             radio_layout = QHBoxLayout()
             self.input_type_group = QButtonGroup()
@@ -242,35 +248,37 @@ class PlatformWidget(QWidget):
             radio_layout.addStretch()
             input_layout.addLayout(radio_layout)
 
-        # URL/Username input
-        input_row = QHBoxLayout()
+        self._input_row_layout = QBoxLayout(QBoxLayout.LeftToRight)
+        self._input_row_layout.setSpacing(10)
+
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText(f"Masukkan URL {self.platform}...")
-        input_row.addWidget(self.url_input)
+        self.url_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._input_row_layout.addWidget(self.url_input, 1)
 
         self.fetch_btn = QPushButton("🔍 Fetch Info")
         self.fetch_btn.setObjectName("primaryButton")
         self.fetch_btn.setMaximumWidth(150)
         self.fetch_btn.clicked.connect(self.fetch_info)
-        input_row.addWidget(self.fetch_btn)
+        self._input_row_layout.addWidget(self.fetch_btn, 0)
 
-        input_layout.addLayout(input_row)
+        input_layout.addLayout(self._input_row_layout)
         layout.addWidget(input_group)
 
-        # Preview section
+        # Preview
         self.preview_group = QGroupBox("Preview")
         self.preview_group.setVisible(False)
-        preview_main_layout = QVBoxLayout(self.preview_group)
+        preview_layout = QVBoxLayout(self.preview_group)
 
-        # Top row: Thumbnail + Info
-        top_row = QHBoxLayout()
+        self._preview_top_layout = QBoxLayout(QBoxLayout.LeftToRight)
+        self._preview_top_layout.setSpacing(12)
 
         self.thumbnail_label = QLabel()
         self.thumbnail_label.setAlignment(Qt.AlignCenter)
-        self.thumbnail_label.setFixedSize(160, 90)
-        self.thumbnail_label.setScaledContents(True)
+        self.thumbnail_label.setScaledContents(False)
         self.thumbnail_label.setStyleSheet("border: 1px solid #3d3d3d; border-radius: 4px;")
-        top_row.addWidget(self.thumbnail_label)
+        self.thumbnail_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._preview_top_layout.addWidget(self.thumbnail_label, 0)
 
         info_layout = QVBoxLayout()
         info_layout.setSpacing(3)
@@ -296,24 +304,24 @@ class PlatformWidget(QWidget):
         info_layout.addWidget(self.views_label)
 
         info_layout.addStretch()
-        top_row.addLayout(info_layout, 1)
-        preview_main_layout.addLayout(top_row)
+        self._preview_top_layout.addLayout(info_layout, 1)
 
-        # Scroll area
+        preview_layout.addLayout(self._preview_top_layout)
+
         self.content_scroll = QScrollArea()
         self.content_scroll.setWidgetResizable(True)
         self.content_scroll.setVisible(False)
-        self.content_scroll.setMaximumHeight(250)
-        preview_main_layout.addWidget(self.content_scroll)
+        self.content_scroll.setMinimumHeight(180)
+        self.content_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        preview_layout.addWidget(self.content_scroll, 1)
 
         layout.addWidget(self.preview_group)
 
-        # Download options section
+        # Options
         self.options_group = QGroupBox("Download Options")
         self.options_group.setVisible(False)
         options_layout = QVBoxLayout(self.options_group)
 
-        # Type selection (Audio/Video) - YouTube & Facebook
         if self.platform in ["YouTube", "Facebook"]:
             type_row = QHBoxLayout()
             type_row.addWidget(QLabel("Type:"))
@@ -332,18 +340,14 @@ class PlatformWidget(QWidget):
             type_row.addStretch()
             options_layout.addLayout(type_row)
 
-        # Quality selection
         quality_row = QHBoxLayout()
         quality_row.addWidget(QLabel("Quality:"))
 
         self.quality_combo = QComboBox()
-        self.quality_combo.setMinimumWidth(150)
-        quality_row.addWidget(self.quality_combo)
-
-        quality_row.addStretch()
+        self.quality_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        quality_row.addWidget(self.quality_combo, 1)
         options_layout.addLayout(quality_row)
 
-        # Trim only for YouTube
         if self.platform == "YouTube":
             trim_group = QGroupBox("✂️ Trim Video (Optional)")
             trim_group.setCheckable(True)
@@ -375,20 +379,19 @@ class PlatformWidget(QWidget):
 
         layout.addWidget(self.options_group)
 
-        # Download button
         self.download_btn = QPushButton("⬇️ Download")
         self.download_btn.setObjectName("primaryButton")
         self.download_btn.setVisible(False)
         self.download_btn.clicked.connect(self.start_download)
+        self.download_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(self.download_btn)
 
-        # Progress section
+        # Progress
         self.progress_group = QGroupBox("Progress")
         self.progress_group.setVisible(False)
         progress_layout = QVBoxLayout(self.progress_group)
 
         self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
         progress_layout.addWidget(self.progress_bar)
 
         self.status_label = QLabel("Ready")
@@ -398,18 +401,52 @@ class PlatformWidget(QWidget):
         layout.addWidget(self.progress_group)
         layout.addStretch()
 
-        # initial default quality
         self.quality_combo.clear()
         self.quality_combo.addItems(["Best Quality"])
 
     # -----------------------------
-    # State Management
+    # Responsive
+    # -----------------------------
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_responsive_rules()
+
+    def _clamp(self, v, lo, hi):
+        return max(lo, min(hi, v))
+
+    def _apply_responsive_rules(self):
+        w = self.width()
+        narrow = w < self.NARROW_WIDTH
+
+        self._input_row_layout.setDirection(QBoxLayout.TopToBottom if narrow else QBoxLayout.LeftToRight)
+        if narrow:
+            self.fetch_btn.setMaximumWidth(16777215)
+            self.fetch_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        else:
+            self.fetch_btn.setMaximumWidth(150)
+            self.fetch_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        self._preview_top_layout.setDirection(QBoxLayout.TopToBottom if narrow else QBoxLayout.LeftToRight)
+
+        if narrow:
+            thumb_w = self._clamp(int(w * 0.55), self.THUMB_MIN_W, self.THUMB_MAX_W)
+        else:
+            thumb_w = self._clamp(int(w * 0.22), self.THUMB_MIN_W, self.THUMB_MAX_W)
+        thumb_h = max(90, int(thumb_w * 9 / 16))
+        self.thumbnail_label.setFixedSize(thumb_w, thumb_h)
+
+        if self._thumb_pixmap_original is not None:
+            scaled = self._thumb_pixmap_original.scaled(
+                thumb_w, thumb_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            self.thumbnail_label.setPixmap(scaled)
+
+    # -----------------------------
+    # State (FIXED)
     # -----------------------------
     def reset_state(self):
-        """Reset state UI & selection agar fetch baru tidak nyangkut state lama."""
         self.current_info = None
 
-        # hapus atribut selection lama biar start_download tidak salah cabang
         for attr in ("video_checkboxes", "post_checkboxes", "story_checkboxes"):
             if hasattr(self, attr):
                 delattr(self, attr)
@@ -424,36 +461,35 @@ class PlatformWidget(QWidget):
 
         self.title_label.setText("")
         self.thumbnail_label.clear()
+        self._thumb_pixmap_original = None
 
         self.content_scroll.setVisible(False)
         self.content_scroll.takeWidget()
 
-        # reset quality
         self.quality_combo.clear()
         self.quality_combo.addItems(["Best Quality"])
 
-        # reset trim UI
         if self.platform == "YouTube" and hasattr(self, "trim_group"):
             self.trim_group.setChecked(False)
             self.trim_group.setVisible(True)
-            if hasattr(self, "start_time_spin"):
-                self.start_time_spin.setValue(0)
-            if hasattr(self, "end_time_spin"):
-                self.end_time_spin.setValue(0)
+            self.start_time_spin.setValue(0)
+            self.end_time_spin.setValue(0)
 
-    def _keep_thread(self, t: QThread):
-        """Simpan reference thread biar tidak ke-GC sebelum selesai."""
-        self._worker_threads.append(t)
-
-        # auto cleanup reference ketika selesai
-        def _cleanup():
+        # cancel old thumbnail safely (guard RuntimeError)
+        t = getattr(self, "_thumb_thread", None)
+        if t is not None:
             try:
-                self._worker_threads.remove(t)
-            except ValueError:
+                if t.isRunning():
+                    try:
+                        t.abort()
+                    except Exception:
+                        pass
+            except RuntimeError:
+                # object already deleted
                 pass
+        self._thumb_thread = None
 
-        t.finished.connect(_cleanup)
-        t.finished.connect(t.deleteLater)
+        self._apply_responsive_rules()
 
     # -----------------------------
     # UI interactions
@@ -467,31 +503,25 @@ class PlatformWidget(QWidget):
             self.url_input.setPlaceholderText(f"Masukkan URL {self.platform}...")
 
     def toggle_download_type(self):
-        """Toggle quality options berdasarkan audio/video."""
-        # kalau belum ada info, isi default saja
         info = self.current_info or {}
 
         if hasattr(self, "audio_radio") and self.audio_radio.isChecked():
             self.quality_combo.clear()
             self.quality_combo.addItems(["320kbps", "192kbps", "128kbps", "64kbps"])
-
-            # trim hanya untuk video
             if hasattr(self, "trim_group"):
                 self.trim_group.setVisible(False)
                 self.trim_group.setChecked(False)
         else:
             self.quality_combo.clear()
             formats = None
-            if info and isinstance(info, dict) and "formats" in info:
+            if isinstance(info, dict) and "formats" in info:
                 formats = info["formats"].get("video")
-
             self.quality_combo.addItems(formats if formats else ["1080p", "720p", "480p", "360p"])
-
             if hasattr(self, "trim_group"):
                 self.trim_group.setVisible(True)
 
     # -----------------------------
-    # Fetch Info
+    # Fetch info
     # -----------------------------
     def fetch_info(self):
         input_text = self.url_input.text().strip()
@@ -502,25 +532,18 @@ class PlatformWidget(QWidget):
         self.reset_state()
 
         self.progress_group.setVisible(True)
-        self.progress_bar.setRange(0, 0)  # indeterminate
+        self.progress_bar.setRange(0, 0)
         self.status_label.setText("Fetching info...")
         self.fetch_btn.setEnabled(False)
         self.download_btn.setEnabled(False)
 
-        # Tentukan method extractor
         if self.platform in ["Instagram", "TikTok"] and hasattr(self, "username_radio"):
             if self.username_radio.isChecked():
                 method = "extract_user_posts"
-                args = (input_text,)
             elif hasattr(self, "story_radio") and self.platform == "Instagram" and self.story_radio.isChecked():
                 method = "extract_story"
-                args = (input_text,)
             else:
-                if self.platform == "Instagram":
-                    method = "extract_post_info"
-                else:
-                    method = "extract_video_info"
-                args = (input_text,)
+                method = "extract_post_info" if self.platform == "Instagram" else "extract_video_info"
         else:
             if self.platform == "YouTube":
                 method = "extract_info"
@@ -528,16 +551,20 @@ class PlatformWidget(QWidget):
                 method = "extract_video_info"
             else:
                 method = "extract_post_info"
-            args = (input_text,)
 
-        self.fetch_thread = DownloadThread(self.downloader, method, *args)
-        self._keep_thread(self.fetch_thread)
-        self.fetch_thread.finished.connect(self.on_info_fetched)
-        self.fetch_thread.error.connect(self.on_error)
-        self.fetch_thread.start()
+        t = CallThread(self.downloader, method, input_text)
+        self._keep_thread(t)
+        self.fetch_thread = t
+
+        t.result.connect(self.on_info_fetched)
+        t.failed.connect(self.on_error)
+        t.start()
 
     @pyqtSlot(dict)
     def on_info_fetched(self, info):
+        if self.sender() is not getattr(self, "fetch_thread", None):
+            return
+
         self.fetch_btn.setEnabled(True)
 
         self.current_info = info or {}
@@ -545,31 +572,24 @@ class PlatformWidget(QWidget):
         self.progress_bar.setValue(100)
         self.status_label.setText("Info fetched successfully!")
 
-        # Show preview
         self.preview_group.setVisible(True)
 
-        # Title
-        title = _shorten(self.current_info.get("title", "Unknown"), 80)
-        self.title_label.setText(title)
+        self.title_label.setText(_shorten(self.current_info.get("title", "Unknown"), 80))
 
-        # Channel (YouTube)
         if self.current_info.get("channel"):
             self.channel_label.setText(f"📺 {self.current_info['channel']}")
             self.channel_label.setVisible(True)
 
-        # Duration
         if self.current_info.get("duration"):
             duration = int(self.current_info["duration"])
             minutes = duration // 60
             seconds = duration % 60
             self.duration_label.setText(f"⏱️ {minutes}:{seconds:02d}")
             self.duration_label.setVisible(True)
-
             if hasattr(self, "end_time_spin"):
                 self.end_time_spin.setMaximum(duration)
                 self.end_time_spin.setValue(duration)
 
-        # Views
         if self.current_info.get("view_count"):
             views = int(self.current_info["view_count"])
             if views >= 1_000_000:
@@ -581,11 +601,9 @@ class PlatformWidget(QWidget):
             self.views_label.setText(f"👁️ {views_str} views")
             self.views_label.setVisible(True)
 
-        # Thumbnail
         if self.current_info.get("thumbnail"):
             self.load_thumbnail(self.current_info["thumbnail"])
 
-        # Handle different types
         if self.current_info.get("type") == "playlist":
             self.show_playlist(self.current_info)
         elif "posts" in self.current_info:
@@ -595,41 +613,55 @@ class PlatformWidget(QWidget):
         else:
             self.show_download_options(self.current_info)
 
-        # Refresh quality based on audio/video toggle
         if hasattr(self, "video_radio"):
             self.toggle_download_type()
 
         self.download_btn.setEnabled(True)
+        self._apply_responsive_rules()
 
     # -----------------------------
-    # Thumbnail (urllib thread)
+    # Thumbnail (FIXED)
     # -----------------------------
     def load_thumbnail(self, url: str):
-        # batalkan thread thumbnail sebelumnya kalau masih jalan
-        if self._thumb_thread and self._thumb_thread.isRunning():
-            self._thumb_thread.abort()
+        # cancel old safely (guard RuntimeError)
+        old = getattr(self, "_thumb_thread", None)
+        if old is not None:
+            try:
+                if old.isRunning():
+                    try:
+                        old.abort()
+                    except Exception:
+                        pass
+            except RuntimeError:
+                pass
+        self._thumb_thread = None
 
-        self._thumb_thread = ThumbnailThread(url)
-        self._keep_thread(self._thumb_thread)
-        self._thumb_thread.finished.connect(self.on_thumbnail_loaded)
-        self._thumb_thread.error.connect(lambda e: self._on_thumbnail_error(e))
-        self._thumb_thread.start()
+        t = ThumbThread(url)
+        self._keep_thread(t)
+        self._thumb_thread = t
+
+        t.data_ready.connect(self.on_thumbnail_data)
+        t.failed.connect(self._on_thumbnail_error)
+        t.start()
 
     @pyqtSlot(bytes)
-    def on_thumbnail_loaded(self, data: bytes):
-        pixmap = QPixmap()
-        ok = pixmap.loadFromData(data)
-        if ok:
-            scaled = pixmap.scaled(160, 90, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.thumbnail_label.setPixmap(scaled)
+    def on_thumbnail_data(self, data: bytes):
+        if self.sender() is not getattr(self, "_thumb_thread", None):
+            return
 
+        pixmap = QPixmap()
+        if pixmap.loadFromData(data):
+            self._thumb_pixmap_original = pixmap
+            self._apply_responsive_rules()
+
+    @pyqtSlot(str)
     def _on_thumbnail_error(self, msg: str):
-        # thumbnail gagal tidak perlu jadi fatal
-        # print untuk debugging saja
+        if self.sender() is not getattr(self, "_thumb_thread", None):
+            return
         print(f"[Thumbnail] {msg}")
 
     # -----------------------------
-    # Content Displays
+    # Content displays
     # -----------------------------
     def show_playlist(self, info):
         videos = info.get("videos", [])
@@ -659,17 +691,19 @@ class PlatformWidget(QWidget):
             self.video_checkboxes.append(checkbox)
 
         content_layout.addStretch()
-
         self.content_scroll.setWidget(content_widget)
         self.content_scroll.setVisible(True)
 
         self.show_download_options(info)
+        self._apply_responsive_rules()
 
     def show_posts(self, info):
         posts = info.get("posts", [])
 
         content_widget = QWidget()
         content_layout = QGridLayout(content_widget)
+        content_layout.setHorizontalSpacing(12)
+        content_layout.setVerticalSpacing(8)
 
         self.post_checkboxes = []
         for i, post in enumerate(posts):
@@ -694,6 +728,7 @@ class PlatformWidget(QWidget):
 
         self.download_btn.setVisible(True)
         self.options_group.setVisible(False)
+        self._apply_responsive_rules()
 
     def show_stories(self, info):
         stories = info.get("stories", [])
@@ -719,30 +754,29 @@ class PlatformWidget(QWidget):
 
         self.download_btn.setVisible(True)
         self.options_group.setVisible(False)
+        self._apply_responsive_rules()
 
     def show_download_options(self, info):
         self.options_group.setVisible(True)
 
-        # Set quality options
         self.quality_combo.clear()
-        if info and isinstance(info, dict) and "formats" in info:
-            # format dipisah audio/video biasanya
+        if isinstance(info, dict) and "formats" in info:
             if hasattr(self, "audio_radio") and self.audio_radio.isChecked():
                 formats = info["formats"].get("audio", ["192kbps"])
             else:
                 formats = info["formats"].get("video", ["720p"])
             self.quality_combo.addItems(formats if formats else ["Best Quality"])
         else:
-            # default fallback
             if hasattr(self, "audio_radio") and self.audio_radio.isChecked():
                 self.quality_combo.addItems(["320kbps", "192kbps", "128kbps"])
             else:
                 self.quality_combo.addItems(["1080p", "720p", "480p", "360p"])
 
         self.download_btn.setVisible(True)
+        self._apply_responsive_rules()
 
     # -----------------------------
-    # Download
+    # Download helpers
     # -----------------------------
     def _call_playlist_with_fallback(self, urls, output_path, quality, download_type):
         attempts = [
@@ -756,14 +790,9 @@ class PlatformWidget(QWidget):
                 return self.downloader.download_playlist(*args)
             except TypeError as e:
                 last_err = e
-                continue
         raise last_err if last_err else TypeError("Signature downloader.download_playlist tidak cocok.")
 
     def _call_single_with_fallback(self, url, output_path, quality, download_type, start_time=None, end_time=None):
-        """
-        Untuk YouTube kamu sebelumnya kirim (url, out, quality, type, None, start, end)
-        Kita pertahankan tetapi pakai fallback biar aman.
-        """
         attempts = [
             (url, output_path, quality, download_type, None, start_time, end_time),
             (url, output_path, quality, download_type),
@@ -776,7 +805,6 @@ class PlatformWidget(QWidget):
                 return self.downloader.download(*args)
             except TypeError as e:
                 last_err = e
-                continue
         raise last_err if last_err else TypeError("Signature downloader.download tidak cocok.")
 
     def start_download(self):
@@ -788,7 +816,6 @@ class PlatformWidget(QWidget):
 
         quality = self.quality_combo.currentText() if self.quality_combo.count() else "Best Quality"
 
-        # Trim hanya untuk YouTube + video + trim_group checked
         start_time = None
         end_time = None
         if (
@@ -808,67 +835,47 @@ class PlatformWidget(QWidget):
         self.download_btn.setEnabled(False)
         self.fetch_btn.setEnabled(False)
 
-        # Playlist
         if hasattr(self, "video_checkboxes"):
-            selected_videos = []
+            urls = []
             for cb in self.video_checkboxes:
                 if cb.isChecked() and getattr(cb, "video_data", None):
-                    # pastikan key url ada
                     u = cb.video_data.get("url")
                     if u:
-                        selected_videos.append(u)
+                        urls.append(u)
 
-            def _run_playlist():
-                return self._call_playlist_with_fallback(selected_videos, output_path, quality, download_type)
-
-            # Jalankan via thread generic
-            self.download_thread = DownloadThread(self, "_download_playlist_wrapper", selected_videos, output_path, quality, download_type)
-            self._keep_thread(self.download_thread)
-            self.download_thread.finished.connect(self.on_download_complete)
-            self.download_thread.error.connect(self.on_error)
-            self.download_thread.start()
+            t = CallThread(self, "_download_playlist_wrapper", urls, output_path, quality, download_type)
+            self._keep_thread(t)
+            self.download_thread = t
+            t.result.connect(self.on_download_complete)
+            t.failed.connect(self.on_error)
+            t.start()
             return
 
-        # Multiple posts/stories -> pakai MultiDownloadThread (biar tidak freeze)
         if hasattr(self, "post_checkboxes"):
-            selected_urls = []
-            for cb in self.post_checkboxes:
-                if cb.isChecked() and getattr(cb, "post_data", None):
-                    u = cb.post_data.get("url")
-                    if u:
-                        selected_urls.append(u)
-
-            self._start_multi_download(selected_urls, output_path, quality, download_type)
+            urls = [cb.post_data.get("url") for cb in self.post_checkboxes if cb.isChecked() and getattr(cb, "post_data", None)]
+            urls = [u for u in urls if u]
+            self._start_multi_download(urls, output_path, quality, download_type)
             return
 
         if hasattr(self, "story_checkboxes"):
-            selected_urls = []
-            for cb in self.story_checkboxes:
-                if cb.isChecked() and getattr(cb, "story_data", None):
-                    u = cb.story_data.get("url")
-                    if u:
-                        selected_urls.append(u)
-
-            self._start_multi_download(selected_urls, output_path, quality, download_type)
+            urls = [cb.story_data.get("url") for cb in self.story_checkboxes if cb.isChecked() and getattr(cb, "story_data", None)]
+            urls = [u for u in urls if u]
+            self._start_multi_download(urls, output_path, quality, download_type)
             return
 
-        # Single download
         url = self.url_input.text().strip()
-        self.download_thread = DownloadThread(
-            self, "_download_single_wrapper",
-            url, output_path, quality, download_type, start_time, end_time
-        )
-        self._keep_thread(self.download_thread)
-        self.download_thread.finished.connect(self.on_download_complete)
-        self.download_thread.error.connect(self.on_error)
-        self.download_thread.start()
+        t = CallThread(self, "_download_single_wrapper", url, output_path, quality, download_type, start_time, end_time)
+        self._keep_thread(t)
+        self.download_thread = t
+        t.result.connect(self.on_download_complete)
+        t.failed.connect(self.on_error)
+        t.start()
 
-    # Wrapper methods so we can use DownloadThread safely
     def _download_single_wrapper(self, url, output_path, quality, download_type, start_time, end_time):
         return self._call_single_with_fallback(url, output_path, quality, download_type, start_time, end_time)
 
-    def _download_playlist_wrapper(self, selected_videos, output_path, quality, download_type):
-        return self._call_playlist_with_fallback(selected_videos, output_path, quality, download_type)
+    def _download_playlist_wrapper(self, urls, output_path, quality, download_type):
+        return self._call_playlist_with_fallback(urls, output_path, quality, download_type)
 
     def _start_multi_download(self, urls, output_path, quality, download_type):
         if not urls:
@@ -881,9 +888,11 @@ class PlatformWidget(QWidget):
 
         t = MultiDownloadThread(self.downloader, urls, output_path, quality=quality, download_type=download_type)
         self._keep_thread(t)
+        self.multi_thread = t
+
         t.progress.connect(self.on_multi_progress)
-        t.finished.connect(self.on_download_complete)
-        t.error.connect(self.on_error)
+        t.done.connect(self.on_download_complete)
+        t.failed.connect(self.on_error)
         t.start()
 
     @pyqtSlot(int, int, str)
@@ -893,7 +902,7 @@ class PlatformWidget(QWidget):
         self.status_label.setText(text)
 
     # -----------------------------
-    # Completion & Errors
+    # Completion & error
     # -----------------------------
     @pyqtSlot(dict)
     def on_download_complete(self, result):
@@ -903,7 +912,6 @@ class PlatformWidget(QWidget):
         self.download_btn.setEnabled(True)
         self.fetch_btn.setEnabled(True)
 
-        # Add to history
         if isinstance(result, dict) and "results" in result:
             for r in result["results"]:
                 if r.get("success"):
@@ -935,22 +943,32 @@ class PlatformWidget(QWidget):
         self.status_label.setText(f"Error: {error_msg}")
         self.download_btn.setEnabled(True)
         self.fetch_btn.setEnabled(True)
-
         QMessageBox.critical(self, "Error", f"Error: {error_msg}")
 
     # -----------------------------
-    # Cleanup on close (avoid running threads)
+    # Cleanup (guard RuntimeError)
     # -----------------------------
     def closeEvent(self, event):
         try:
-            if self._thumb_thread and self._thumb_thread.isRunning():
-                self._thumb_thread.abort()
+            t = getattr(self, "_thumb_thread", None)
+            if t is not None:
+                try:
+                    if t.isRunning():
+                        try:
+                            t.abort()
+                        except Exception:
+                            pass
+                except RuntimeError:
+                    pass
+            self._thumb_thread = None
 
-            # kalau ada MultiDownloadThread yang berjalan, abort (kalau ada)
-            for t in list(self._worker_threads):
-                if isinstance(t, MultiDownloadThread) and t.isRunning():
-                    t.abort()
+            for t in list(self._threads):
+                if isinstance(t, MultiDownloadThread):
+                    try:
+                        if t.isRunning():
+                            t.abort()
+                    except RuntimeError:
+                        pass
         except Exception:
             pass
-
         super().closeEvent(event)
